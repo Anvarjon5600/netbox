@@ -1,55 +1,68 @@
-import requests
-from dcim.models import Device, Site
-from virtualization.models import (
-    VirtualMachine, Cluster, ClusterType,
-    VMInterface, IPAddress
-)
+import os
+import sys
+from pathlib import Path
+
+# Добавляем путь к NetBox в PYTHONPATH
+netbox_path = str(Path('/opt/netbox/netbox').resolve())
+if netbox_path not in sys.path:
+    sys.path.insert(0, netbox_path)
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'netbox.settings')
+import django
+django.setup()
+
+from dcim.models import Device, DeviceType, Manufacturer, Site
+from virtualization.models import VirtualMachine, Cluster, ClusterType, VMInterface
+from ipam.models import IPAddress
 from tenancy.models import Tenant
 from extras.models import CustomField
+import requests
 
-# Конфиг Nutanix
-NUTANIX_URL = "https://172.16.100.30:9440/api/nutanix/v3"
-AUTH = ("admin", "sDV}2[PG;:K*tz7FH3yJ5Y")
+class Script:
+    def __init__(self):
+        self.NUTANIX_URL = "https://172.16.100.30:9440/api/nutanix/v3"
+        self.AUTH = ("admin", 'sDV}2[PG;:K*tz7FH3yJ5Y')
 
-def create_custom_fields():
-    """Создает кастомные поля в NetBox при первом запуске"""
-    CustomField.objects.get_or_create(
-        name='nutanix_uuid',
-        type='text',
-        label='Nutanix UUID'
-    )
-    CustomField.objects.get_or_create(
-        name='nutanix_host',
-        type='text',
-        label='Nutanix Host'
-    )
+    def create_custom_fields(self):
+        """Создает кастомные поля в NetBox"""
+        CustomField.objects.get_or_create(
+            name='nutanix_uuid',
+            type='text',
+            label='Nutanix UUID'
+        )
+        CustomField.objects.get_or_create(
+            name='nutanix_host',
+            type='text',
+            label='Nutanix Host'
+        )
 
-def sync_nutanix_full():
-    create_custom_fields()
-    
-    # Создаем структуру в NetBox
-    cluster_type, _ = ClusterType.objects.get_or_create(name="Nutanix")
-    cluster, _ = Cluster.objects.get_or_create(
-        name="Nutanix Cluster",
-        type=cluster_type,
-        site=Site.objects.get_or_create(name="Nutanix DC", slug="nutanix-dc")[0]
-    )
+    def sync_nutanix_vms(self):
+        self.create_custom_fields()
+        
+        cluster_type, _ = ClusterType.objects.get_or_create(name="Nutanix")
+        cluster, _ = Cluster.objects.get_or_create(
+            name="Nutanix Cluster",
+            type=cluster_type,
+            site=Site.objects.get_or_create(name="Nutanix DC", slug="nutanix-dc")[0]
+        )
 
-    # Получаем ВМ из Nutanix
-    vms = requests.post(
-        f"{NUTANIX_URL}/vms/list",
-        auth=AUTH,
-        verify=False,
-        json={"kind": "vm", "length": 250}  # 250 - лимит запроса
-    ).json().get('entities', [])
+        response = requests.post(
+            f"{self.NUTANIX_URL}/vms/list",
+            auth=self.AUTH,
+            verify=False,
+            json={"kind": "vm", "length": 250}
+        )
+        vms = response.json().get('entities', [])
 
-    for vm in vms:
+        for vm in vms:
+            self.process_vm(vm, cluster)
+
+    def process_vm(self, vm, cluster):
         spec = vm.get('spec', {})
         resources = spec.get('resources', {})
         metadata = vm.get('metadata', {})
 
-        # Основные параметры ВМ
-        vm_obj, created = VirtualMachine.objects.update_or_create(
+        vm_obj, _ = VirtualMachine.objects.update_or_create(
             name=spec.get('name'),
             defaults={
                 'status': 'active' if resources.get('power_state') == 'ON' else 'offline',
@@ -67,7 +80,10 @@ def sync_nutanix_full():
             }
         )
 
-        # Сетевые интерфейсы и IP-адреса
+        self.process_interfaces(vm_obj, resources)
+        self.process_host(resources)
+
+    def process_interfaces(self, vm_obj, resources):
         for nic in resources.get('nic_list', []):
             if nic.get('is_connected', False):
                 vif, _ = VMInterface.objects.update_or_create(
@@ -79,9 +95,8 @@ def sync_nutanix_full():
                     }
                 )
                 
-                # IP-адреса
                 for ip_data in nic.get('ip_endpoint_list', []):
-                    ip, _ = IPAddress.objects.get_or_create(
+                    IPAddress.objects.get_or_create(
                         address=ip_data.get('ip'),
                         defaults={
                             'assigned_object_type': 'virtualization.vminterface',
@@ -89,13 +104,18 @@ def sync_nutanix_full():
                         }
                     )
 
-        # CPU и хосты (дополнительные данные)
-        host_data = requests.get(
-            f"{NUTANIX_URL}/hosts/{resources.get('host_reference', {}).get('uuid')}",
-            auth=AUTH,
+    def process_host(self, resources):
+        host_uuid = resources.get('host_reference', {}).get('uuid')
+        if not host_uuid:
+            return
+
+        response = requests.get(
+            f"{self.NUTANIX_URL}/hosts/{host_uuid}",
+            auth=self.AUTH,
             verify=False
-        ).json()
-        
+        )
+        host_data = response.json()
+
         if host_data:
             Device.objects.update_or_create(
                 name=host_data.get('spec', {}).get('name'),
@@ -112,5 +132,9 @@ def sync_nutanix_full():
                 }
             )
 
+def run(*args, **kwargs):
+    script = Script()
+    script.sync_nutanix_vms()
+
 if __name__ == '__main__':
-    sync_nutanix_full()
+    run()
