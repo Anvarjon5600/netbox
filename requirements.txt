@@ -1,0 +1,16 @@
+# Основные зависимости
+requests==2.31.0
+python-dotenv==1.0.0
+netaddr==0.9.0
+
+# Для работы с Nutanix API
+nutanix-api-client==2.1.0
+pyopenssl==23.2.0
+
+# Зависимости NetBox (основные)
+django==4.2
+djangorestframework==3.14.0
+
+# Для обработки данных
+xmltodict==0.13.0
+deepdiff==6.3.0
